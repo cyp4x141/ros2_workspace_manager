@@ -7,7 +7,7 @@ from PyQt5.QtWidgets import (
     QSpinBox, QToolBar, QAction, QLineEdit, QTextEdit,
     QStatusBar, QComboBox, QSplitter, QStyle, QProgressBar,
     QTableWidget, QTableWidgetItem, QHeaderView, QDialog,
-    QGraphicsView, QGraphicsScene,
+    QGraphicsView, QGraphicsScene, QMenu,
 )
 from PyQt5.QtCore import Qt, QProcess, QSize, QPointF, QRectF
 from PyQt5.QtGui import QPen, QBrush, QColor, QFont, QPolygonF, QWheelEvent
@@ -83,6 +83,53 @@ class WorkspaceManagerGUI(QMainWindow):
             return deps
         except (ET.ParseError, AttributeError):
             return set()
+
+    def get_package_size(self, package_path):
+        """计算包文件夹的大小"""
+        try:
+            total_size = 0
+            seen_inodes = set()  # 用于避免硬链接重复计算
+            
+            for dirpath, dirnames, filenames in os.walk(package_path):
+                # 跳过一些常见的大型缓存目录
+                dirnames[:] = [d for d in dirnames if d not in ['.git', '__pycache__', '.pytest_cache', 'build', '.vscode']]
+                
+                for filename in filenames:
+                    filepath = os.path.join(dirpath, filename)
+                    try:
+                        # 获取文件状态
+                        stat_info = os.lstat(filepath)  # 使用lstat避免跟随符号链接
+                        
+                        # 检查是否是硬链接（避免重复计算）
+                        inode = (stat_info.st_dev, stat_info.st_ino)
+                        if inode in seen_inodes:
+                            continue
+                        seen_inodes.add(inode)
+                        
+                        # 只计算常规文件的大小
+                        if os.path.isfile(filepath) and not os.path.islink(filepath):
+                            total_size += stat_info.st_size
+                        elif os.path.islink(filepath):
+                            # 符号链接本身的大小（链接路径的长度）
+                            total_size += len(os.readlink(filepath))
+                            
+                    except (OSError, IOError):
+                        # 跳过无法访问的文件
+                        continue
+            return total_size
+        except Exception:
+            return 0
+
+    def format_size(self, size_bytes):
+        """格式化文件大小显示"""
+        if size_bytes == 0:
+            return "0 B"
+        elif size_bytes < 1024:
+            return f"{size_bytes} B"
+        elif size_bytes < 1024 * 1024:  # 小于1MB
+            return f"{size_bytes / 1024:.1f} KB"
+        else:  # 大于等于1MB
+            return f"{size_bytes / (1024 * 1024):.1f} MB"
 
 
     def load_config(self):
@@ -165,13 +212,16 @@ class WorkspaceManagerGUI(QMainWindow):
         packages_group = QGroupBox('包列表')
         packages_layout = QVBoxLayout()
         # 表格形式展示包
-        self.packages_table = QTableWidget(0, 2)
-        self.packages_table.setHorizontalHeaderLabels(['选择', '包名'])
+        self.packages_table = QTableWidget(0, 3)
+        self.packages_table.setHorizontalHeaderLabels(['选择', '包名', '包大小'])
         header = self.packages_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
         self.packages_table.setAlternatingRowColors(True)
         self.packages_table.setShowGrid(True)
+        self.packages_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.packages_table.customContextMenuRequested.connect(self.show_package_context_menu)
         packages_layout.addWidget(self.packages_table)
         packages_group.setLayout(packages_layout)
         splitter.addWidget(packages_group)
@@ -412,12 +462,14 @@ class WorkspaceManagerGUI(QMainWindow):
 
         # 第一遍：收集所有包和它们的依赖
         available_packages = {}
+        package_paths = {}  # 存储包路径用于计算大小
         for root, dirs, files in os.walk(src_dir):
             if 'package.xml' in files:
                 package_xml_path = os.path.join(root, 'package.xml')
                 package_name = self.get_package_name_from_xml(package_xml_path)
                 if package_name:
                     available_packages[package_name] = package_xml_path
+                    package_paths[package_name] = root  # 存储包的根目录路径
                     self.package_dependencies[package_name] = set()
                     self.reverse_dependencies[package_name] = set()
 
@@ -436,19 +488,35 @@ class WorkspaceManagerGUI(QMainWindow):
             row = self.packages_table.rowCount()
             self.packages_table.insertRow(row)
 
-            # 选择列：复选框
+            # 选择列：复选框（居中显示）
             checkbox = QCheckBox()
             if package_name in self.config.get('last_selected_packages', []):
                 checkbox.setChecked(True)
             checkbox.stateChanged.connect(
                 lambda state, pkg=package_name: self.on_package_checkbox_changed(pkg, state)
             )
-            self.packages_table.setCellWidget(row, 0, checkbox)
+            
+            # 创建一个容器widget来让复选框居中
+            checkbox_widget = QWidget()
+            checkbox_layout = QHBoxLayout(checkbox_widget)
+            checkbox_layout.addWidget(checkbox)
+            checkbox_layout.setAlignment(Qt.AlignCenter)
+            checkbox_layout.setContentsMargins(0, 0, 0, 0)
+            
+            self.packages_table.setCellWidget(row, 0, checkbox_widget)
 
             # 包名列
             item = QTableWidgetItem(package_name)
             item.setFlags(item.flags() & ~Qt.ItemIsEditable)
             self.packages_table.setItem(row, 1, item)
+
+            # 包大小列
+            package_path = package_paths[package_name]
+            package_size = self.get_package_size(package_path)
+            size_text = self.format_size(package_size)
+            size_item = QTableWidgetItem(size_text)
+            size_item.setFlags(size_item.flags() & ~Qt.ItemIsEditable)
+            self.packages_table.setItem(row, 2, size_item)
 
             self.package_checkboxes[package_name] = checkbox
 
@@ -832,3 +900,166 @@ class WorkspaceManagerGUI(QMainWindow):
             if dep in self.package_checkboxes:
                 self.package_checkboxes[dep].setChecked(False)
                 self.deselect_dependent_packages(dep, visited)
+
+    def show_package_context_menu(self, position):
+        """显示包列表的右键菜单"""
+        item = self.packages_table.itemAt(position)
+        if item is None:
+            return
+            
+        row = item.row()
+        package_name_item = self.packages_table.item(row, 1)
+        if package_name_item is None:
+            return
+            
+        package_name = package_name_item.text()
+        
+        menu = QMenu(self)
+        
+        # 显示包详细信息
+        detail_action = QAction('显示包详细信息', self)
+        detail_action.triggered.connect(lambda: self.show_package_details(package_name))
+        menu.addAction(detail_action)
+        
+        # 在鼠标位置显示菜单
+        menu.exec_(self.packages_table.mapToGlobal(position))
+
+    def show_package_details(self, package_name):
+        """显示包的详细信息对话框"""
+        if not self.workspace_root:
+            return
+            
+        # 查找包路径
+        src_dir = os.path.join(self.workspace_root, 'src')
+        package_path = None
+        
+        for root, dirs, files in os.walk(src_dir):
+            if 'package.xml' in files:
+                package_xml_path = os.path.join(root, 'package.xml')
+                found_name = self.get_package_name_from_xml(package_xml_path)
+                if found_name == package_name:
+                    package_path = root
+                    break
+        
+        if not package_path:
+            QMessageBox.warning(self, '错误', f'找不到包 {package_name} 的路径')
+            return
+            
+        # 计算详细的大小信息
+        details = self.get_package_detailed_info(package_path)
+        
+        # 创建详细信息对话框
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f'包详细信息 - {package_name}')
+        dialog.resize(600, 400)
+        
+        layout = QVBoxLayout(dialog)
+        
+        # 基本信息
+        info_text = QTextEdit()
+        info_text.setReadOnly(True)
+        
+        info_content = f"""包名: {package_name}
+路径: {package_path}
+总大小: {self.format_size(details['total_size'])}
+
+文件统计:
+- 总文件数: {details['file_count']}
+- 普通文件: {details['regular_files']} ({self.format_size(details['regular_size'])})
+- 符号链接: {details['symlinks']} ({self.format_size(details['symlink_size'])})
+- 跳过的文件: {details['skipped_files']}
+
+目录统计:
+- 总目录数: {details['dir_count']}
+- 跳过的目录: {details['skipped_dirs']}
+
+大文件 (>100KB):
+"""
+        
+        for file_info in details['large_files']:
+            info_content += f"- {file_info['name']}: {self.format_size(file_info['size'])}\n"
+            
+        info_text.setPlainText(info_content)
+        layout.addWidget(info_text)
+        
+        # 关闭按钮
+        close_btn = QPushButton('关闭')
+        close_btn.clicked.connect(dialog.close)
+        layout.addWidget(close_btn)
+        
+        dialog.exec_()
+
+    def get_package_detailed_info(self, package_path):
+        """获取包的详细信息"""
+        details = {
+            'total_size': 0,
+            'file_count': 0,
+            'regular_files': 0,
+            'regular_size': 0,
+            'symlinks': 0,
+            'symlink_size': 0,
+            'skipped_files': 0,
+            'dir_count': 0,
+            'skipped_dirs': 0,
+            'large_files': []
+        }
+        
+        try:
+            seen_inodes = set()
+            
+            for dirpath, dirnames, filenames in os.walk(package_path):
+                details['dir_count'] += 1
+                
+                # 跳过一些常见的大型缓存目录
+                original_dirs = dirnames[:]
+                dirnames[:] = [d for d in dirnames if d not in ['.git', '__pycache__', '.pytest_cache', 'build', '.vscode']]
+                details['skipped_dirs'] += len(original_dirs) - len(dirnames)
+                
+                for filename in filenames:
+                    filepath = os.path.join(dirpath, filename)
+                    details['file_count'] += 1
+                    
+                    try:
+                        # 获取文件状态
+                        stat_info = os.lstat(filepath)
+                        
+                        # 检查是否是硬链接（避免重复计算）
+                        inode = (stat_info.st_dev, stat_info.st_ino)
+                        if inode in seen_inodes:
+                            continue
+                        seen_inodes.add(inode)
+                        
+                        if os.path.isfile(filepath) and not os.path.islink(filepath):
+                            # 普通文件
+                            details['regular_files'] += 1
+                            details['regular_size'] += stat_info.st_size
+                            details['total_size'] += stat_info.st_size
+                            
+                            # 记录大文件
+                            if stat_info.st_size > 100 * 1024:  # 大于100KB
+                                relative_path = os.path.relpath(filepath, package_path)
+                                details['large_files'].append({
+                                    'name': relative_path,
+                                    'size': stat_info.st_size
+                                })
+                                
+                        elif os.path.islink(filepath):
+                            # 符号链接
+                            details['symlinks'] += 1
+                            link_size = len(os.readlink(filepath))
+                            details['symlink_size'] += link_size
+                            details['total_size'] += link_size
+                            
+                    except (OSError, IOError):
+                        details['skipped_files'] += 1
+                        continue
+                        
+            # 按大小排序大文件列表
+            details['large_files'].sort(key=lambda x: x['size'], reverse=True)
+            # 只保留前10个最大的文件
+            details['large_files'] = details['large_files'][:10]
+            
+        except Exception as e:
+            print(f"Error getting package details: {e}")
+            
+        return details
