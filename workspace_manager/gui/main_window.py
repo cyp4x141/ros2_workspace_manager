@@ -7,7 +7,7 @@ from PyQt5.QtWidgets import (
     QSpinBox, QToolBar, QAction, QLineEdit, QTextEdit,
     QStatusBar, QComboBox, QSplitter, QStyle, QProgressBar,
     QTableWidget, QTableWidgetItem, QHeaderView, QDialog,
-    QGraphicsView, QGraphicsScene, QMenu,
+    QGraphicsView, QGraphicsScene, QMenu, QGraphicsRectItem, QGraphicsTextItem,
 )
 from PyQt5.QtCore import Qt, QProcess, QSize, QPointF, QRectF
 from PyQt5.QtGui import QPen, QBrush, QColor, QFont, QPolygonF, QWheelEvent
@@ -36,6 +36,205 @@ class ZoomableGraphicsView(QGraphicsView):
             # 向下滚动，缩小
             self.scale(1 / self.zoom_factor, 1 / self.zoom_factor)
         event.accept()
+
+
+class ClickableNodeItem(QGraphicsRectItem):
+    """可点击的节点图形项，支持选中状态和高亮"""
+    def __init__(self, rect, package_name, is_selected, theme_name, parent=None):
+        super().__init__(rect, parent)
+        self.package_name = package_name
+        self.is_initially_selected = is_selected
+        self.theme_name = theme_name
+        self.highlight_type = None  # None, 'incoming'(黄色), 'outgoing'(红色)
+        self.text_item = None
+        
+        # 设置标志
+        self.setFlag(QGraphicsRectItem.ItemIsSelectable, True)
+        self.setAcceptHoverEvents(True)
+        
+        # 设置初始颜色
+        self._update_colors()
+    
+    def _update_colors(self):
+        """根据状态更新颜色"""
+        if self.isSelected():
+            # 选中状态 - 使用绿色
+            color_bg = QColor(50, 180, 50)
+            color_border = QColor(100, 220, 100)
+            text_color = QColor(255, 255, 255)
+        elif self.highlight_type == 'incoming':
+            # 指向选中节点的节点 - 使用黄色
+            color_bg = QColor(220, 180, 30)
+            color_border = QColor(255, 220, 80)
+            text_color = QColor(255, 255, 255)
+        elif self.highlight_type == 'outgoing':
+            # 选中节点指向的节点 - 使用红色
+            color_bg = QColor(220, 60, 60)
+            color_border = QColor(255, 100, 100)
+            text_color = QColor(255, 255, 255)
+        elif self.is_initially_selected:
+            # 初始选中的包（从包列表选中的）
+            if self.theme_name == 'light':
+                color_bg = QColor(25, 118, 210)
+                color_border = QColor(208, 208, 208)
+                text_color = QColor(255, 255, 255)
+            else:
+                color_bg = QColor(94, 129, 172)
+                color_border = QColor(59, 66, 82)
+                text_color = QColor(255, 255, 255)
+        else:
+            # 普通状态
+            if self.theme_name == 'light':
+                color_bg = QColor(255, 255, 255)
+                color_border = QColor(208, 208, 208)
+                text_color = QColor(33, 33, 33)
+            else:
+                color_bg = QColor(42, 47, 58)
+                color_border = QColor(59, 66, 82)
+                text_color = QColor(230, 230, 230)
+        
+        self.setBrush(QBrush(color_bg))
+        pen = QPen(color_border)
+        pen.setWidth(3 if self.isSelected() else 2 if self.highlight_type else 1)
+        self.setPen(pen)
+        
+        # 更新文本颜色
+        if self.text_item:
+            self.text_item.setDefaultTextColor(text_color)
+    
+    def set_highlight_type(self, highlight_type):
+        """设置高亮类型：None, 'incoming'(黄色), 'outgoing'(红色)"""
+        self.highlight_type = highlight_type
+        self._update_colors()
+    
+    def mousePressEvent(self, event):
+        """处理鼠标点击事件"""
+        if event.button() == Qt.LeftButton:
+            # 获取当前场景
+            if self.scene():
+                # 先取消所有节点的选中状态
+                for node in self.scene().node_items.values():
+                    if node != self and node.isSelected():
+                        node.setSelected(False)
+                        node._update_colors()
+                
+                # 切换当前节点的选中状态
+                self.setSelected(not self.isSelected())
+                self._update_colors()
+                
+                # 通知场景更新相关节点高亮
+                self.scene().update_node_highlights()
+        
+        super().mousePressEvent(event)
+    
+    def hoverEnterEvent(self, event):
+        """鼠标悬停进入"""
+        self.setCursor(Qt.PointingHandCursor)
+        super().hoverEnterEvent(event)
+    
+    def hoverLeaveEvent(self, event):
+        """鼠标悬停离开"""
+        self.setCursor(Qt.ArrowCursor)
+        super().hoverLeaveEvent(event)
+
+
+class DependencyGraphScene(QGraphicsScene):
+    """依赖关系图场景，管理节点高亮和边的颜色"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.node_items = {}  # package_name -> ClickableNodeItem
+        self.edges = []  # [(src_name, dest_name), ...]
+        self.edge_items = []  # 存储边的图形项 [(line_item, arrow_item, src, dest), ...]
+        self.theme_name = 'dark'
+    
+    def update_node_highlights(self):
+        """更新所有节点的高亮状态和边的颜色"""
+        # 获取当前选中的节点
+        selected_nodes = set()
+        for node_item in self.node_items.values():
+            if node_item.isSelected():
+                selected_nodes.add(node_item.package_name)
+        
+        if not selected_nodes:
+            # 如果没有选中节点，清除所有高亮和边的颜色
+            for node_item in self.node_items.values():
+                node_item.set_highlight_type(None)
+            self._reset_edge_colors()
+            return
+        
+        # 对于选中的节点，区分入边和出边
+        selected_node = list(selected_nodes)[0]  # 只支持单选
+        incoming_nodes = set()  # 指向选中节点的节点（黄色）
+        outgoing_nodes = set()  # 选中节点指向的节点（红色）
+        
+        for src, dest in self.edges:
+            if dest == selected_node:
+                incoming_nodes.add(src)
+            if src == selected_node:
+                outgoing_nodes.add(dest)
+        
+        # 更新所有节点的高亮状态
+        for package_name, node_item in self.node_items.items():
+            if package_name in selected_nodes:
+                # 选中的节点不设置高亮
+                node_item.set_highlight_type(None)
+            elif package_name in incoming_nodes:
+                # 指向选中节点的节点 - 黄色
+                node_item.set_highlight_type('incoming')
+            elif package_name in outgoing_nodes:
+                # 选中节点指向的节点 - 红色
+                node_item.set_highlight_type('outgoing')
+            else:
+                # 其他节点取消高亮
+                node_item.set_highlight_type(None)
+        
+        # 更新边的颜色
+        self._update_edge_colors(selected_node, incoming_nodes, outgoing_nodes)
+    
+    def _reset_edge_colors(self):
+        """重置所有边为默认颜色"""
+        default_color = QColor(136, 192, 208) if self.theme_name == 'dark' else QColor(100, 100, 100)
+        default_pen = QPen(default_color)
+        default_pen.setWidth(1)
+        
+        for line_item, arrow_item, _, _ in self.edge_items:
+            line_item.setPen(default_pen)
+            if arrow_item:
+                arrow_item.setPen(default_pen)
+                arrow_item.setBrush(QBrush(default_color))
+    
+    def _update_edge_colors(self, selected_node, incoming_nodes, outgoing_nodes):
+        """更新边的颜色"""
+        default_color = QColor(136, 192, 208) if self.theme_name == 'dark' else QColor(100, 100, 100)
+        yellow_color = QColor(255, 220, 80)  # 黄色 - 指向选中节点的边
+        red_color = QColor(255, 100, 100)    # 红色 - 选中节点指向的边
+        
+        for line_item, arrow_item, src, dest in self.edge_items:
+            if dest == selected_node and src in incoming_nodes:
+                # 指向选中节点的边 - 黄色
+                pen = QPen(yellow_color)
+                pen.setWidth(2)
+                line_item.setPen(pen)
+                if arrow_item:
+                    arrow_item.setPen(pen)
+                    arrow_item.setBrush(QBrush(yellow_color))
+            elif src == selected_node and dest in outgoing_nodes:
+                # 选中节点指向的边 - 红色
+                pen = QPen(red_color)
+                pen.setWidth(2)
+                line_item.setPen(pen)
+                if arrow_item:
+                    arrow_item.setPen(pen)
+                    arrow_item.setBrush(QBrush(red_color))
+            else:
+                # 其他边 - 默认颜色
+                pen = QPen(default_color)
+                pen.setWidth(1)
+                line_item.setPen(pen)
+                if arrow_item:
+                    arrow_item.setPen(pen)
+                    arrow_item.setBrush(QBrush(default_color))
+
 
 class WorkspaceManagerGUI(QMainWindow):
     def __init__(self, node):
@@ -763,7 +962,9 @@ class WorkspaceManagerGUI(QMainWindow):
 
     def _build_dependency_scene(self, nodes, edges, selected_set):
         """根据 nodes/edges 构建简单分层布局图。"""
-        scene = QGraphicsScene()
+        scene = DependencyGraphScene()
+        scene.edges = [(s, d) for s, d in edges]  # 保存边信息
+        scene.theme_name = self.theme_name  # 设置主题
 
         # 计算层（拓扑层次）
         deps_map = {n: set() for n in nodes}
@@ -807,41 +1008,37 @@ class WorkspaceManagerGUI(QMainWindow):
                 pos[n] = QPointF(x, y)
 
         # 先画节点
-        node_items = {}
         for n, p in pos.items():
             rect = QRectF(p.x(), p.y(), RECT_W, RECT_H)
-            color_bg = QColor(94, 129, 172) if n in selected_set else QColor(42, 47, 58)
-            color_border = QColor(59, 66, 82)
-            if self.theme_name == 'light':
-                color_bg = QColor(25, 118, 210) if n in selected_set else QColor(255, 255, 255)
-                color_border = QColor(208, 208, 208)
-
-            brush = QBrush(color_bg)
-            pen = QPen(color_border)
-            pen.setWidth(1)
-            scene.addRect(rect, pen, brush)
+            
+            # 创建可点击的节点项
+            node_item = ClickableNodeItem(rect, n, n in selected_set, self.theme_name)
+            scene.addItem(node_item)
+            scene.node_items[n] = node_item
 
             # 文本
-            text_color = QColor(255, 255, 255) if n in selected_set and self.theme_name == 'dark' else QColor(230, 230, 230) if self.theme_name == 'dark' else QColor(33, 33, 33)
-            text_item = scene.addText(n, QFont('Sans', 9))
-            text_item.setDefaultTextColor(text_color)
+            text_item = QGraphicsTextItem(n, node_item)
+            text_item.setFont(QFont('Sans', 9))
             # 居中放置
             tb = text_item.boundingRect()
             text_item.setPos(rect.center().x() - tb.width()/2, rect.center().y() - tb.height()/2)
-            node_items[n] = rect
+            node_item.text_item = text_item
 
         # 再画边
         edge_pen = QPen(QColor(136, 192, 208) if self.theme_name == 'dark' else QColor(100, 100, 100))
+        edge_pen.setWidth(1)
+        
         for s, d in edges:
-            if s not in node_items or d not in node_items:
+            if s not in scene.node_items or d not in scene.node_items:
                 continue
-            rs = node_items[s]
-            rd = node_items[d]
+            rs = scene.node_items[s].rect()
+            rd = scene.node_items[d].rect()
             start = QPointF(rs.right(), rs.center().y())
             end = QPointF(rd.left(), rd.center().y())
-            scene.addLine(start.x(), start.y(), end.x(), end.y(), edge_pen)
+            line_item = scene.addLine(start.x(), start.y(), end.x(), end.y(), edge_pen)
 
             # 箭头
+            arrow_item = None
             try:
                 dx = end.x() - start.x()
                 dy = end.y() - start.y()
@@ -852,9 +1049,12 @@ class WorkspaceManagerGUI(QMainWindow):
                 p2 = QPointF(end.x() - ux*arrow_size - uy*arrow_size/2, end.y() - uy*arrow_size + ux*arrow_size/2)
                 p3 = QPointF(end.x() - ux*arrow_size + uy*arrow_size/2, end.y() - uy*arrow_size - ux*arrow_size/2)
                 poly = QPolygonF([p1, p2, p3])
-                scene.addPolygon(poly, edge_pen, QBrush(edge_pen.color()))
+                arrow_item = scene.addPolygon(poly, edge_pen, QBrush(edge_pen.color()))
             except Exception:
                 pass
+            
+            # 保存边的图形项以便后续更新颜色
+            scene.edge_items.append((line_item, arrow_item, s, d))
 
         # 视图边界
         scene.setSceneRect(scene.itemsBoundingRect().adjusted(-40, -40, 80, 80))
