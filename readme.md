@@ -1,5 +1,6 @@
 # Workspace Manager
-
+[![Build and Test](https://github.com/cyp4x141/ros2_workspace_manager/actions/workflows/build.yml/badge.svg)](
+https://github.com/cyp4x141/ros2_workspace_manager/actions/workflows/build.yml)  
 一个用于管理 ROS2 工作空间的图形化工具，支持选择性编译、清理和管理 ROS2 包。
 
 ## 功能特点
@@ -17,6 +18,11 @@
 - 🧰 构建类型预设（Release/Debug/让CMakeLists决定），紧邻 symlink 安装
 - 🧭 环境信息展示（ROS_DISTRO）
 - 🕸️ 包依赖关系图（选中包优先显示其依赖，否则显示全部）
+  - 🎯 交互式节点选择：点击节点可查看其依赖关系
+  - 🟢 选中的节点显示为**绿色**
+  - 🟡 指向选中节点的节点（依赖源）显示为**黄色**，连线也为黄色
+  - 🔴 选中节点指向的节点（被依赖）显示为**红色**，连线也为红色
+  - 🔍 支持鼠标滚轮缩放和拖拽移动
 
 ## 安装
 
