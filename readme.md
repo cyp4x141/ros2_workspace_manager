@@ -1,139 +1,100 @@
 # Workspace Manager
-[![Build and Test](https://github.com/cyp4x141/ros2_workspace_manager/actions/workflows/build.yml/badge.svg)](
-https://github.com/cyp4x141/ros2_workspace_manager/actions/workflows/build.yml)  
-一个用于管理 ROS2 工作空间的图形化工具，支持选择性编译、清理和管理 ROS2 包。
 
-## 功能特点
+用于 Linux / ROS 2 Humble 开发工作空间的 PyQt5 管理工具。支持包发现、用户目标和自动依赖选择、依赖图、构建日志、进程组取消，以及有明确边界的编译产物清理。
 
-- 📂 图形化选择工作空间目录
-- 📦 自动检测并显示工作空间中的所有 ROS2 包
-- ✅ 支持多选进行选择性编译
-- 🔄 支持 symlink-install 模式
-- 🧹 智能清理功能（保留关键文件）
-- 💾 自动保存配置和上次选择
-- 🎛️ 工具栏快捷操作（全选/反选/刷新/清理/停止）
-- 🔍 包名搜索过滤
-- 🌓 主题切换（浅色/深色，内置 QSS 样式）
-- 📜 实时构建日志面板 + 状态栏进度
-- 🧰 构建类型预设（Release/Debug/让CMakeLists决定），紧邻 symlink 安装
-- 🧭 环境信息展示（ROS_DISTRO）
-- 🕸️ 包依赖关系图（选中包优先显示其依赖，否则显示全部）
-  - 🎯 交互式节点选择：点击节点可查看其依赖关系
-  - 🟢 选中的节点显示为**绿色**
-  - 🟡 指向选中节点的节点（依赖源）显示为**黄色**，连线也为黄色
-  - 🔴 选中节点指向的节点（被依赖）显示为**红色**，连线也为红色
-  - 🔍 支持鼠标滚轮缩放和拖拽移动
+## 安装与启动
 
-## 安装
+将本项目保留在工作空间的源码目录中。仓库目录名为 `ros2_workspace_manager`，ROS 包名及 Python 包名为 `workspace_manager`。
 
-1. 将本包克隆到你的 ROS2 工作空间的 src 目录：
+安装运行依赖：
+
 ```bash
-cd ~/your_workspace/src
-git clone https://github.com/LockedFlysher/ros2_workspace_manager.git
+sudo apt install python3-pyqt5 python3-yaml python3-catkin-pkg python3-colcon-common-extensions
 ```
 
-2. 安装依赖：
-```bash
-sudo apt update
-sudo apt install libgtk-3-dev
-sudo apt install python3-pyqt5  # PyQt5
-pip3 install pyyaml            # PyYAML
-```
+在 ROS 2 环境中构建并启动：
 
-3. 编译工作空间：
 ```bash
-cd ~/your_workspace
 colcon build --packages-select workspace_manager
-```
-
-4. 设置环境：
-```bash
-source ~/your_workspace/install/setup.bash
-```
-
-## 使用方法
-
-1. 启动工具：
-```bash
+source install/setup.bash
 ros2 run workspace_manager workspace_manager
 ```
 
-2. 基本操作：
-    - 点击 "Select Workspace" 选择 ROS2 工作空间目录
-    - 在包列表中选择需要编译的包
-    - 根据需要勾选 "Symlink Install" 选项
-    - 点击 "Build Selected" 开始编译
-    - 使用 "Clean" 按钮清理工作空间（会保留必要文件）
+普通安装和 `--symlink-install` 均保留支持。运行时需要保留工具源码；单独拷贝 `install` 不属于此版本的完整部署方式。
 
-## 配置文件
+## 配置位置
 
-配置文件位于 `install/workspace_manager/share/workspace_manager/config/config.yaml`，包含：
-- 上次选择的工作空间路径
-- 上次选择的包列表
-- Symlink Install 选项状态
+配置固定在**工具自身源码**的 `workspace_manager/config/config.yaml`，其中 `<workspace>` 表示存放工具源码的工作空间：
 
-## 注意事项
-
-- 清理功能会保留以下文件：
-    - build 目录中的：
-        - .cache 目录
-        - .idea 目录
-        - COLCON_IGNORE
-        - compile_commands.json
-        - .built_by
-    - install 目录中的：
-        - COLCON_IGNORE
-
-## 依赖项
-
-- ROS2（已测试于 Humble）
-- Python 3.8+
-- PyQt5
-- PyYAML
-
-## 开发说明
-
-### 项目结构
-```
-workspace_manager/
-├── workspace_manager/
-│   ├── __init__.py
-│   ├── workspace_manager_node.py
-│   ├── gui/
-│   │   ├── __init__.py
-│   │   └── main_window.py
-│   └── config/
-│       └── config.yaml
-├── setup.py
-├── setup.cfg
-├── package.xml
-└── resource/
+```text
+<workspace>/src/ros2_workspace_manager/workspace_manager/config/config.yaml
 ```
 
-### 构建新版本
+切换被管理的工作空间不会改变这个配置文件的位置。工具不再将运行配置安装到 `install/share`，也不会回退到用户的 `.config` 目录。
 
-1. 更新 `setup.py` 中的版本号
-2. 更新 `package.xml` 中的版本号
-3. 重新构建：
+源码定位顺序：显式 `WORKSPACE_MANAGER_SOURCE_ROOT` → 实际模块所在源码项目 → 当前安装前缀附近的工作空间源码目录。多个候选或无法定位时报告错误。自定义安装目录或源码搬迁时可指定包含本项目 `package.xml` 的目录：
+
 ```bash
-colcon build --packages-select workspace_manager
+export WORKSPACE_MANAGER_SOURCE_ROOT=/absolute/path/to/ros2_workspace_manager
+ros2 run workspace_manager workspace_manager
 ```
 
-## 贡献
+`config.example.yaml` 是公开字段示例，`workspace_path` 保持为空，`workspaces` 保持为空字典；程序中的默认值负责缺失字段的补全。源码配置不存在时直接创建默认配置，不自动导入旧安装目录中的配置。仅有旧安装配置的用户，可在关闭程序后将其主动复制到上述源码配置位置；已有源码配置需要先自行保留。加载仍兼容旧格式，会将原勾选迁移为用户目标，并在首次保存前保留原文件备份。
 
-欢迎提交 Issue 和 Pull Request！
+`config.yaml` 保存本机偏好和工作空间记录。当前用户主目录及其子目录在写入时使用 `~`，例如 `~/dev_ws/example_ws`；主目录以外的路径保持绝对路径。读取时统一还原为规范化绝对路径，供工作空间匹配、构建与清理使用。同一工作空间有多个路径写法时合并包选择，其他重复会话字段采用后出现的值。该表示继续使用配置版本 2，并兼容已有绝对路径配置。
+
+实际配置、备份、锁文件、临时文件和 Python 缓存不纳入版本控制。新配置与新备份按仅当前用户可读写的权限创建。备份保留原始内容；路径缩写也仍然包含目录名称，分享时应使用公开示例。分发源码应从审查后的 Git 提交导出受控文件，直接压缩整个工作目录可能带上被忽略的私人文件。取消跟踪不会清除历史提交中的内容，已有历史或远端副本需要单独处理。
+
+配置保留主题、置顶、符号链接安装、并行包数、CMake 构建类型等偏好。`workspaces` 按工作空间规范化路径分别记录 `explicit_targets`。`parallel_workers` 控制并行包任务数，不是所有编译器线程的总上限。`auto` 不传递 CMake 构建类型，也不会清除已有的 CMake 缓存。
+
+保存通过独立锁文件、原文件摘要校核和同目录原子替换完成。其他实例或编辑器修改配置后，当前实例会拒绝覆盖；可使用工具栏“重新加载配置”读取外部修改，此操作会替换当前未保存的内存设置。配置不可读、版本不支持或目录不可写时会提示原因，禁止静默更换保存位置。
+
+## 包发现与选择
+
+- 通过 `colcon list` 发现包，扫描范围明确限定为目标工作空间的 `src`。
+- 使用 `catkin_pkg` 解析清单、条件及组成员关系。重复包名和解析错误会阻止构建。
+- 用户目标与自动依赖分开记录。自动依赖不能直接取消，需要先取消引用它的目标。
+- 刷新保留当前目标；切换工作空间恢复各自的目标。搜索仅过滤显示，“全选”仍选择全部包。
+- colcon 校核成功前不开放构建；构建前再次校核集合，范围变化会更新列表并要求重新检查。
+- 依赖图展示清单关系，箭头从依赖方指向被依赖方。外部依赖保存在包模型中，不因未出现在源码内而直接判为缺失。colcon 元数据补充的依赖通过实际选择校核处理。
+
+此版本支持 ROS 清单包。没有 `package.xml` 的通用 colcon 包会显示不支持诊断。默认配置中的隐藏包选择、发现路径、额外 metas/mixin，以及包元数据中的路径或选择覆盖会被拒绝，避免预览与实际构建不一致。
+
+## 构建与停止
+
+构建使用 `--packages-up-to`，固定工作空间、目标、参数和扫描时的环境快照。日志显示工作空间、ROS_DISTRO 和最终命令。当前版本继承启动环境，不自动切换 ROS 发行版或清洗 underlay；环境改变后应重新启动工具并刷新。
+
+同一窗口一次只执行一项扫描、校核、构建或清理。构建期间不能切换工作空间、刷新或改变目标。停止操作向已确认的本任务进程组依次发送 SIGINT、SIGTERM、SIGKILL，并等待退出检查后才释放操作锁。用户取消与启动失败、崩溃、正常构建失败分别显示。
+
+关闭窗口会先取消活动命令；清理已经开始时等待它完成后退出。日志使用增量 UTF-8 解码、尾部刷新和纯文本显示，界面最多保留 6000 个文本块。
+
+## 清理范围
+
+清理对话框提供“仅清理 build”和“清理 build 和 install”，详细信息列出删除与保留项目。
+
+- 只支持标准产物目录。产物根目录若为符号链接，拒绝进入其目标。
+- 目录内部的符号链接只删除链接本身，包括断链。
+- 根级 `build` 保留 `.cache`、`.idea`、`COLCON_IGNORE`、`compile_commands.json`、`.built_by`。
+- 根级 `install` 保留 `COLCON_IGNORE` 和 `.colcon_install_layout`，以维持原安装布局。
+- 保留规则只针对根级条目；包目录内部的同名文件不在保留范围。保留的编译数据库链接可能因产物删除而失效。
+- 如果删除范围包含当前工具正在使用的安装前缀、程序文件或工具源码，拒绝该范围；可以选择可用的 build 范围，或从另一个管理工作空间启动后执行完整清理。
+- 确认后再次检查目录身份和条目变化，使用打开的目录描述符约束删除路径；部分失败明确列出原因。
+- 本次没有按包清理功能，避免误用独立安装目录规则处理合并安装。
+
+构建与清理在目标工作空间根目录使用 `.workspace_manager.lock`。锁文件保留在磁盘上，操作结束只释放锁。该约定只约束合作的工具实例，不能阻止用户在外部终端直接运行 colcon。请勿同时在外部修改正在清理的目录。
+
+进程组退出保证针对正常操作流程；GUI 被外部强杀、子程序主动脱离会话、受限 `/proc` 等情况不属于完整自动恢复范围。清理后的编译产物需要重新构建，配置备份不能恢复被删除的产物。
+
+## 代码组织与检查
+
+`core` 包包含配置、模型、清单解析、依赖、构建计划、清理和锁；`gui/process_runner.py` 负责 QProcess 适配，`process_launcher.py` 仅使用标准库建立 Linux 会话。主窗口负责交互和任务衔接。
+
+本次按要求没有新增测试文件，也不运行 test 或 pytest。CI 仅做 Python AST 解析、package.xml 解析、默认值与公开 YAML 示例的空白工作空间检查、私人文件跟踪检查和补丁空白检查，不执行构建或应用业务逻辑。隐私检查采用字段约束和文件类型规则，不硬编码个人标识。静态检查不能替代真实 ROS 环境中的运行验证。
 
 ## 许可证
+
 没有，但在B站点个关注即可随意分发
 
 ## 作者
 
 B站id：晴糖豆
-
-## 更新日志
-
-### v0.0.1
-- 初始版本
-- 基本的工作空间管理功能
-- 包选择和编译功能
-- 工作空间清理功能

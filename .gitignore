@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+build/
+install/
+log/
+workspace_manager/config/config.yaml
+workspace_manager/config/config.yaml.bak.*
+workspace_manager/config/.config.lock
+workspace_manager/config/.config-*.tmp
+.workspace_manager.lock

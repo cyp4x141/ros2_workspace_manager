@@ -1,26 +1,76 @@
-name: ROS2 Package Build Test
+name: Source Static Checks
 
 on:
   push:
-    branches: [ main, develop ]
+    branches: [main, develop]
   pull_request:
-    branches: [ main, develop ]
-    types: [ opened]
+    branches: [main, develop]
+    types: [opened, synchronize, reopened]
 
 jobs:
-  build:
+  static-checks:
     runs-on: ubuntu-22.04
-    container:
-      image: ros:humble
-
     steps:
-      - uses: actions/checkout@v3
-
-      - name: Install dependencies
+      - uses: actions/checkout@v4
+      - name: Install YAML parser for static metadata checks
+        run: python3 -m pip install PyYAML
+      - name: Parse Python and package metadata without importing application code
         run: |
-          apt-get update
-          apt-get install -y python3-colcon-common-extensions
+          python3 - <<'PYCODE'
+          import ast
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
 
-      - name: Build workspace
+          for path in Path('workspace_manager').rglob('*.py'):
+              ast.parse(path.read_text(encoding='utf-8'), filename=str(path))
+          ast.parse(Path('setup.py').read_text(encoding='utf-8'), filename='setup.py')
+          ET.parse('package.xml')
+          print('Source syntax and package XML parsed successfully.')
+          PYCODE
+      - name: Check public configuration and private file tracking
         run: |
-          colcon build
+          python3 - <<'PYCODE'
+          import ast
+          import os
+          from pathlib import Path, PurePosixPath
+          import subprocess
+
+          import yaml
+
+          errors = []
+          config_dir = Path('workspace_manager/config')
+          example = yaml.safe_load((config_dir / 'config.example.yaml').read_text(encoding='utf-8'))
+          if (not isinstance(example, dict)
+                  or example.get('workspace_path') != ''
+                  or example.get('workspaces') != {}):
+              errors.append('Public configuration must have an empty workspace and history.')
+
+          module = ast.parse(Path('workspace_manager/core/config_store.py').read_text(encoding='utf-8'))
+          default_function = next(node for node in module.body
+                                  if isinstance(node, ast.FunctionDef) and node.name == 'defaults')
+          default_dict = next(node.value for node in default_function.body
+                              if isinstance(node, ast.Return))
+          values = {ast.literal_eval(key): value
+                    for key, value in zip(default_dict.keys, default_dict.values)}
+          if (ast.literal_eval(values['workspace_path']) != ''
+                  or ast.literal_eval(values['workspaces']) != {}):
+              errors.append('Code defaults must have an empty workspace and history.')
+
+          tracked = subprocess.check_output(['git', 'ls-files', '-z']).split(b'\0')
+          for entry in filter(None, tracked):
+              path = PurePosixPath(os.fsdecode(entry))
+              private_config = (
+                  path.parent == PurePosixPath('workspace_manager/config')
+                  and (path.name in {'config.yaml', '.config.lock'}
+                       or path.name.startswith('config.yaml.bak.')
+                       or (path.name.startswith('.config-') and path.suffix == '.tmp')))
+              if (private_config or '__pycache__' in path.parts
+                      or path.suffix in {'.pyc', '.pyo', '.pyd'}
+                      or path.name == '.workspace_manager.lock'):
+                  errors.append(f'Private state or cache must not be tracked: {path}')
+          if errors:
+              raise SystemExit('\n'.join(errors))
+          print('Public defaults are empty; no private state or Python cache is tracked.')
+          PYCODE
+      - name: Check patch whitespace
+        run: git show --format= --check HEAD

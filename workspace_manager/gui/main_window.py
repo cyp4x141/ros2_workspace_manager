@@ -5,17 +5,30 @@ from PyQt5.QtWidgets import (
     QPushButton, QLabel, QMessageBox, QCheckBox,
     QFileDialog, QGroupBox,
     QSpinBox, QToolBar, QAction, QLineEdit, QTextEdit,
-    QStatusBar, QComboBox, QSplitter, QStyle, QProgressBar,
+    QStatusBar, QComboBox, QSplitter, QProgressBar,
     QTableWidget, QTableWidgetItem, QHeaderView, QDialog,
     QGraphicsView, QGraphicsScene, QMenu, QGraphicsRectItem, QGraphicsTextItem,
 )
-from PyQt5.QtCore import Qt, QProcess, QSize, QPointF, QRectF
-from PyQt5.QtGui import QPen, QBrush, QColor, QFont, QPolygonF, QWheelEvent
+from PyQt5.QtCore import (
+    Qt, QSize, QPointF, QRectF, QSignalBlocker, QTimer,
+    QObject, QRunnable, QThreadPool, pyqtSignal,
+)
+from PyQt5.QtGui import QPen, QBrush, QColor, QFont, QPolygonF, QWheelEvent, QTextCursor
 import os
-import yaml
-import xml.etree.ElementTree as ET
-import shutil
-from ament_index_python.packages import get_package_share_directory
+import copy
+from pathlib import Path
+import shlex
+import sys
+
+from ..core.build_plan import build_request, colcon_program
+from ..core.cleaner import execute_clean_plan, make_clean_plan
+from ..core.dependency_graph import closure
+from ..core.locks import workspace_lock
+from ..core.package_scanner import (
+    WorkspaceError, discovery_arguments, fingerprint, parse_discovery,
+    parse_selection, validate_colcon_configuration, validate_root,
+)
+from .process_runner import ProcessRunner
 
 
 class ZoomableGraphicsView(QGraphicsView):
@@ -47,14 +60,14 @@ class ClickableNodeItem(QGraphicsRectItem):
         self.theme_name = theme_name
         self.highlight_type = None  # None, 'incoming'(黄色), 'outgoing'(红色)
         self.text_item = None
-        
+
         # 设置标志
         self.setFlag(QGraphicsRectItem.ItemIsSelectable, True)
         self.setAcceptHoverEvents(True)
-        
+
         # 设置初始颜色
         self._update_colors()
-    
+
     def _update_colors(self):
         """根据状态更新颜色"""
         if self.isSelected():
@@ -92,21 +105,21 @@ class ClickableNodeItem(QGraphicsRectItem):
                 color_bg = QColor(42, 47, 58)
                 color_border = QColor(59, 66, 82)
                 text_color = QColor(230, 230, 230)
-        
+
         self.setBrush(QBrush(color_bg))
         pen = QPen(color_border)
         pen.setWidth(3 if self.isSelected() else 2 if self.highlight_type else 1)
         self.setPen(pen)
-        
+
         # 更新文本颜色
         if self.text_item:
             self.text_item.setDefaultTextColor(text_color)
-    
+
     def set_highlight_type(self, highlight_type):
         """设置高亮类型：None, 'incoming'(黄色), 'outgoing'(红色)"""
         self.highlight_type = highlight_type
         self._update_colors()
-    
+
     def mousePressEvent(self, event):
         """处理鼠标点击事件"""
         if event.button() == Qt.LeftButton:
@@ -117,21 +130,21 @@ class ClickableNodeItem(QGraphicsRectItem):
                     if node != self and node.isSelected():
                         node.setSelected(False)
                         node._update_colors()
-                
+
                 # 切换当前节点的选中状态
                 self.setSelected(not self.isSelected())
                 self._update_colors()
-                
+
                 # 通知场景更新相关节点高亮
                 self.scene().update_node_highlights()
-        
+
         super().mousePressEvent(event)
-    
+
     def hoverEnterEvent(self, event):
         """鼠标悬停进入"""
         self.setCursor(Qt.PointingHandCursor)
         super().hoverEnterEvent(event)
-    
+
     def hoverLeaveEvent(self, event):
         """鼠标悬停离开"""
         self.setCursor(Qt.ArrowCursor)
@@ -146,7 +159,7 @@ class DependencyGraphScene(QGraphicsScene):
         self.edges = []  # [(src_name, dest_name), ...]
         self.edge_items = []  # 存储边的图形项 [(line_item, arrow_item, src, dest), ...]
         self.theme_name = 'dark'
-    
+
     def update_node_highlights(self):
         """更新所有节点的高亮状态和边的颜色"""
         # 获取当前选中的节点
@@ -154,25 +167,25 @@ class DependencyGraphScene(QGraphicsScene):
         for node_item in self.node_items.values():
             if node_item.isSelected():
                 selected_nodes.add(node_item.package_name)
-        
+
         if not selected_nodes:
             # 如果没有选中节点，清除所有高亮和边的颜色
             for node_item in self.node_items.values():
                 node_item.set_highlight_type(None)
             self._reset_edge_colors()
             return
-        
+
         # 对于选中的节点，区分入边和出边
         selected_node = list(selected_nodes)[0]  # 只支持单选
         incoming_nodes = set()  # 指向选中节点的节点（黄色）
         outgoing_nodes = set()  # 选中节点指向的节点（红色）
-        
+
         for src, dest in self.edges:
             if dest == selected_node:
                 incoming_nodes.add(src)
             if src == selected_node:
                 outgoing_nodes.add(dest)
-        
+
         # 更新所有节点的高亮状态
         for package_name, node_item in self.node_items.items():
             if package_name in selected_nodes:
@@ -187,28 +200,28 @@ class DependencyGraphScene(QGraphicsScene):
             else:
                 # 其他节点取消高亮
                 node_item.set_highlight_type(None)
-        
+
         # 更新边的颜色
         self._update_edge_colors(selected_node, incoming_nodes, outgoing_nodes)
-    
+
     def _reset_edge_colors(self):
         """重置所有边为默认颜色"""
         default_color = QColor(136, 192, 208) if self.theme_name == 'dark' else QColor(100, 100, 100)
         default_pen = QPen(default_color)
         default_pen.setWidth(1)
-        
+
         for line_item, arrow_item, _, _ in self.edge_items:
             line_item.setPen(default_pen)
             if arrow_item:
                 arrow_item.setPen(default_pen)
                 arrow_item.setBrush(QBrush(default_color))
-    
+
     def _update_edge_colors(self, selected_node, incoming_nodes, outgoing_nodes):
         """更新边的颜色"""
         default_color = QColor(136, 192, 208) if self.theme_name == 'dark' else QColor(100, 100, 100)
         yellow_color = QColor(255, 220, 80)  # 黄色 - 指向选中节点的边
         red_color = QColor(255, 100, 100)    # 红色 - 选中节点指向的边
-        
+
         for line_item, arrow_item, src, dest in self.edge_items:
             if dest == selected_node and src in incoming_nodes:
                 # 指向选中节点的边 - 黄色
@@ -236,82 +249,92 @@ class DependencyGraphScene(QGraphicsScene):
                     arrow_item.setBrush(QBrush(default_color))
 
 
+class _CleanSignals(QObject):
+    completed = pyqtSignal(object, str)
+
+
+class _CleanWorker(QRunnable):
+    def __init__(self, plan):
+        super().__init__()
+        self.plan = plan
+        self.signals = _CleanSignals()
+
+    def run(self):
+        try:
+            self.signals.completed.emit(execute_clean_plan(self.plan), '')
+        except Exception as exc:
+            self.signals.completed.emit(None, str(exc))
+
+
 class WorkspaceManagerGUI(QMainWindow):
-    def __init__(self, node):
+    def __init__(self, node, config_store, source_root, install_prefix):
         super().__init__()
         self.node = node
+        self.config_store = config_store
+        self.source_root = Path(source_root)
+        self.install_prefix = Path(install_prefix)
+        self.config_file = str(config_store.path)
+        self.config = copy.deepcopy(config_store.data)
         self.workspace_root = None
+        self.snapshot = None
+        self.explicit_targets = set()
+        self.effective_packages = set()
+        self.selection_verified = False
         self.package_checkboxes = {}
-        self.config_file = os.path.join(
-            get_package_share_directory('workspace_manager'),
-            'config',
-            'config.yaml'
-        )
-        self.load_config()
-        self.build_process = None
-        self.theme_name = self.config.get('theme', 'dark')
+        self.package_dependencies = {}
+        self.reverse_dependencies = {}
+        self.operation = 'idle'
+        self._operation_id = None
+        self._operation_callback = None
+        self._operation_lock = None
+        self._close_pending = False
+        self._initializing = True
+        self._clean_worker = None
+        self.theme_name = self.config['theme']
+        self.always_on_top = self.config['always_on_top']
+        self.runner = ProcessRunner(self.source_root / 'workspace_manager/process_launcher.py', self)
+        self.runner.output.connect(self._on_process_output)
+        self.runner.completed.connect(self._on_process_completed)
         self.setupUI()
-        # 应用主题
-        try:
-            self.apply_theme(self.theme_name)
-        except Exception:
-            pass
-        self.package_dependencies = {}  # 存储包的依赖关系
-        self.reverse_dependencies = {}  # 存储反向依赖关系
-        self.always_on_top = False  # 添加一个标志来跟踪窗口是否置顶
-
-        # 如果配置文件中有工作空间路径，则加载它
-        if self.config.get('workspace_path'):
-            self.workspace_root = self.config['workspace_path']
-            self.workspace_path.setText(self.workspace_root)
-            self.refresh_packages()
-
-    def get_package_dependencies(self, package_xml_path):
-        """解析package.xml获取依赖关系"""
-        try:
-            tree = ET.parse(package_xml_path)
-            root = tree.getroot()
-            deps = set()
-
-            # 检查所有类型的依赖
-            for dep_type in ['depend', 'build_depend', 'build_export_depend',
-                             'exec_depend', 'test_depend']:
-                for dep in root.findall(dep_type):
-                    if dep.text:
-                        deps.add(dep.text)
-            return deps
-        except (ET.ParseError, AttributeError):
-            return set()
+        self.apply_theme(self.theme_name)
+        self._initializing = False
+        self._set_operation('idle')
+        self._append_log(f'配置文件: {self.config_file}')
+        for warning in self.config_store.warnings:
+            self._append_log('[配置] ' + warning)
+        initial_root = self.config.get('workspace_path')
+        if initial_root:
+            QTimer.singleShot(0, lambda: self._scan_workspace(initial_root, restore=True))
 
     def get_package_size(self, package_path):
         """计算包文件夹的大小"""
         try:
             total_size = 0
             seen_inodes = set()  # 用于避免硬链接重复计算
-            
+
             for dirpath, dirnames, filenames in os.walk(package_path):
                 # 跳过一些常见的大型缓存目录
                 dirnames[:] = [d for d in dirnames if d not in ['.git', '__pycache__', '.pytest_cache', 'build', '.vscode']]
-                
+
                 for filename in filenames:
                     filepath = os.path.join(dirpath, filename)
                     try:
                         # 获取文件状态
                         stat_info = os.lstat(filepath)  # 使用lstat避免跟随符号链接
-                        
+
                         # 检查是否是硬链接（避免重复计算）
                         inode = (stat_info.st_dev, stat_info.st_ino)
                         if inode in seen_inodes:
                             continue
                         seen_inodes.add(inode)
-                        
+
                         # 只计算常规文件的大小
                         if os.path.isfile(filepath) and not os.path.islink(filepath):
                             total_size += stat_info.st_size
                         elif os.path.islink(filepath):
                             # 符号链接本身的大小（链接路径的长度）
                             total_size += len(os.readlink(filepath))
-                            
+
                     except (OSError, IOError):
                         # 跳过无法访问的文件
                         continue
@@ -332,48 +355,55 @@ class WorkspaceManagerGUI(QMainWindow):
 
 
     def load_config(self):
-        try:
-            with open(self.config_file, 'r') as f:
-                self.config = yaml.safe_load(f)
-        except (FileNotFoundError, yaml.YAMLError):
-            # 默认配置
-            self.config = {
-                'workspace_path': '',
-                'last_selected_packages': [],
-                'symlink_install': True,
-                'always_on_top': False,  # 添加新的配置项
-                'parallel_workers': os.cpu_count() or 8,
-                'theme': 'dark',
-                'build_type': 'auto',
-            }
+        if self.operation != 'idle':
+            return
+        self.config_store.load()
+        self.config = copy.deepcopy(self.config_store.data)
+        widgets = (self.symlink_check, self.workers_spin, self.build_type_combo,
+                   self.theme_combo, self.always_on_top_btn)
+        blockers = [QSignalBlocker(widget) for widget in widgets]
+        self.symlink_check.setChecked(self.config['symlink_install'])
+        self.workers_spin.setValue(self.config['parallel_workers'])
+        self.build_type_combo.setCurrentIndex(
+            self.build_type_combo.findData(self.config['build_type']))
+        self.theme_combo.setCurrentIndex(self.theme_combo.findData(self.config['theme']))
+        self.always_on_top_btn.setChecked(self.config['always_on_top'])
+        self.always_on_top = self.config['always_on_top']
+        self.set_always_on_top(self.always_on_top)
+        self.theme_name = self.config['theme']
+        self.apply_theme(self.theme_name)
+        del blockers
+        for warning in self.config_store.warnings:
+            self._append_log('[配置] ' + warning)
+        root = self.config.get('workspace_path') or self.workspace_root
+        if root:
+            self._scan_workspace(root, restore=True)
 
-    def save_config(self):
-        self.config['workspace_path'] = self.workspace_root or ''
-        self.config['last_selected_packages'] = [
-            pkg for pkg, cb in self.package_checkboxes.items()
-            if cb.isChecked()
-        ]
-        self.config['symlink_install'] = self.symlink_check.isChecked()
-        self.config['always_on_top'] = self.always_on_top  # 保存置顶状态
-        # 保存并同步并行编译线程数
+    def save_config(self, *_args):
+        if self._initializing:
+            return True
+        candidate = copy.deepcopy(self.config)
+        candidate.update({
+            'workspace_path': self.workspace_root or '',
+            'symlink_install': self.symlink_check.isChecked(),
+            'always_on_top': self.always_on_top,
+            'parallel_workers': self.workers_spin.value(),
+            'theme': self.theme_combo.currentData(),
+            'build_type': self.build_type_combo.currentData(),
+        })
+        if self.workspace_root:
+            sessions = candidate.setdefault('workspaces', {})
+            sessions.setdefault(self.workspace_root, {})['explicit_targets'] = sorted(
+                self.explicit_targets)
+        self.config = candidate
         try:
-            self.config['parallel_workers'] = int(self.workers_spin.value())
-        except Exception:
-            self.config['parallel_workers'] = os.cpu_count() or 8
-        # 保存主题
-        try:
-            self.config['theme'] = self.theme_combo.currentData() or self.theme_name
-        except Exception:
-            self.config['theme'] = self.theme_name
-        # 保存构建类型（使用 data 存储）
-        try:
-            self.config['build_type'] = self.build_type_combo.currentData()
-        except Exception:
-            self.config['build_type'] = 'auto'
-
-        os.makedirs(os.path.dirname(self.config_file), exist_ok=True)
-        with open(self.config_file, 'w') as f:
-            yaml.dump(self.config, f)
+            self.config_store.save(candidate)
+            self.config = copy.deepcopy(self.config_store.data)
+            return True
+        except (OSError, RuntimeError, ValueError) as exc:
+            self._append_log(f'[配置未保存] {exc}')
+            self.status.showMessage('配置未保存；可使用“重新加载配置”处理外部修改')
+            return False
 
     def setupUI(self):
         self.setWindowTitle('ROS2 Workspace Manager')
@@ -429,6 +459,7 @@ class WorkspaceManagerGUI(QMainWindow):
         self.log_group = QGroupBox('构建日志')
         log_layout = QVBoxLayout()
         self.log_text = QTextEdit(readOnly=True)
+        self.log_text.document().setMaximumBlockCount(6000)
         self.log_text.setPlaceholderText('编译输出将在此显示...')
         log_layout.addWidget(self.log_text)
         self.log_group.setLayout(log_layout)
@@ -447,6 +478,7 @@ class WorkspaceManagerGUI(QMainWindow):
         options_layout.setContentsMargins(0, 6, 0, 6)
         self.symlink_check = QCheckBox('符号链接安装 (symlink)')
         self.symlink_check.setChecked(self.config.get('symlink_install', True))
+        self.symlink_check.stateChanged.connect(self.save_config)
         options_layout.addWidget(self.symlink_check)
 
         # 构建类型（Release/Debug/让CMakeLists决定）紧邻 symlink 选项
@@ -470,7 +502,7 @@ class WorkspaceManagerGUI(QMainWindow):
         self.always_on_top_btn.clicked.connect(self.toggle_always_on_top)
         options_layout.addWidget(self.always_on_top_btn)
 
-        options_layout.addWidget(QLabel('并行线程'))
+        options_layout.addWidget(QLabel('并行包数'))
         self.workers_spin = QSpinBox()
         self.workers_spin.setMinimum(1)
         max_workers = os.cpu_count() or 32
@@ -557,28 +589,33 @@ class WorkspaceManagerGUI(QMainWindow):
                 # 设置X11属性
                 self.windowHandle().setProperty("_NET_WM_STATE_ABOVE", on_top)
         except Exception as e:
-            print(f"无法设置X11窗口属性: {e}")
+            self.node.get_logger().warning(f"无法设置X11窗口属性: {e}")
 
     def _create_toolbar_actions(self):
         """创建工具栏动作并绑定（文字按钮）。"""
 
+        self._workspace_actions = []
         act_select_ws = QAction('选择工作空间', self)
+        self._workspace_actions.append(act_select_ws)
         act_select_ws.triggered.connect(self.select_workspace)
         self.toolbar.addAction(act_select_ws)
 
         act_refresh = QAction('刷新', self)
         act_refresh.triggered.connect(self.refresh_packages)
         self.toolbar.addAction(act_refresh)
+        self._workspace_actions.append(act_refresh)
 
         self.toolbar.addSeparator()
 
         act_select_all = QAction('全选', self)
         act_select_all.triggered.connect(self.select_all_packages)
         self.toolbar.addAction(act_select_all)
+        self._workspace_actions.append(act_select_all)
 
         act_deselect_all = QAction('全不选', self)
         act_deselect_all.triggered.connect(self.deselect_all_packages)
         self.toolbar.addAction(act_deselect_all)
+        self._workspace_actions.append(act_deselect_all)
 
         self.toolbar.addSeparator()
 
@@ -586,7 +623,12 @@ class WorkspaceManagerGUI(QMainWindow):
         act_graph = QAction('依赖关系图', self)
         act_graph.triggered.connect(self.show_dependency_graph)
         self.toolbar.addAction(act_graph)
+        self._workspace_actions.append(act_graph)
 
+        act_reload = QAction('重新加载配置', self)
+        act_reload.triggered.connect(self.load_config)
+        self.toolbar.addAction(act_reload)
+        self._workspace_actions.append(act_reload)
         self.toolbar.addSeparator()
 
         # 仅保留“停止编译”在工具栏；构建/清理移动到底部
@@ -605,7 +647,7 @@ class WorkspaceManagerGUI(QMainWindow):
     def apply_theme(self, theme_name: str):
         """应用主题（light/dark）。"""
         try:
-            share_dir = get_package_share_directory('workspace_manager')
+            share_dir = str(self.source_root / 'workspace_manager')
             qss_name = 'style_dark.qss' if theme_name == 'dark' else 'style_light.qss'
             qss_path = os.path.join(share_dir, 'gui', qss_name)
             if os.path.exists(qss_path):
@@ -614,288 +656,394 @@ class WorkspaceManagerGUI(QMainWindow):
             else:
                 self.setStyleSheet('')
         except Exception as exc:
-            print(f'Failed to apply theme: {exc}')
+            self.node.get_logger().warning(f'Failed to apply theme: {exc}')
 
     def select_all_packages(self):
-        for checkbox in self.package_checkboxes.values():
-            checkbox.setChecked(True)
+        if self.operation == 'idle' and self.snapshot:
+            self.explicit_targets = set(self.snapshot.packages)
+            self._update_selection()
 
     def deselect_all_packages(self):
-        for checkbox in self.package_checkboxes.values():
-            checkbox.setChecked(False)
+        if self.operation == 'idle':
+            self.explicit_targets.clear()
+            self._update_selection()
 
     def select_workspace(self):
-        dir_path = QFileDialog.getExistingDirectory(self, 'Select Workspace Root')
-        if dir_path:
-            self.workspace_root = dir_path
-            self.workspace_path.setText(dir_path)
-            self.refresh_packages()
-            self.save_config()
-
-    def get_package_name_from_xml(self, package_xml_path):
-        try:
-            tree = ET.parse(package_xml_path)
-            root = tree.getroot()
-            return root.find('name').text
-        except (ET.ParseError, AttributeError):
-            return None
+        if self.operation != 'idle':
+            return
+        path = QFileDialog.getExistingDirectory(self, '选择工作空间根目录')
+        if path:
+            self._scan_workspace(path, restore=True)
 
     def refresh_packages(self):
-        if not self.workspace_root:
-            QMessageBox.warning(self, 'Error', 'Please select workspace first!')
-            return
+        if self.operation == 'idle' and self.workspace_root:
+            self._scan_workspace(self.workspace_root, restore=False)
 
-        src_dir = os.path.join(self.workspace_root, 'src')
-        if not os.path.exists(src_dir):
-            QMessageBox.warning(self, 'Error', 'src directory not found!')
+    def _scan_workspace(self, path, restore):
+        if self.operation != 'idle':
             return
-
-        # 清空现有的表格条目
         try:
-            self.packages_table.setRowCount(0)
-        except Exception:
-            pass
+            root = validate_root(path)
+            environment = dict(os.environ)
+            environment['PWD'] = str(root)
+            validate_colcon_configuration(root, environment)
+            initial = fingerprint(root, environment)
+            program = colcon_program(environment)
+            targets = (set(self.config.get('workspaces', {}).get(str(root), {}).get(
+                'explicit_targets', [])) if restore else set(self.explicit_targets))
+
+            def scanned(result):
+                if not result.succeeded:
+                    self._report_process_failure(result, '扫描')
+                    return
+                snapshot = parse_discovery(
+                    root, result.stdout, result.stderr, environment, initial)
+                if snapshot.errors:
+                    for message in (*snapshot.diagnostics, *snapshot.errors):
+                        self._append_log('[扫描] ' + message)
+                    if self.snapshot and self.snapshot.root == root:
+                        self.selection_verified = False
+                    self._show_error('候选工作空间存在扫描错误，未替换当前列表；请检查日志')
+                    return
+                self.snapshot = snapshot
+                self.workspace_root = str(root)
+                self.workspace_path.setText(str(root))
+                self.package_dependencies = snapshot.dependencies
+                self.reverse_dependencies = snapshot.reverse_dependencies
+                disappeared = targets.difference(snapshot.packages)
+                self.explicit_targets = targets.intersection(snapshot.packages)
+                if disappeared:
+                    self._append_log('已移除不存在的目标: ' + ', '.join(sorted(disappeared)))
+                self._fill_packages_table()
+                for message in (*snapshot.diagnostics, *snapshot.errors):
+                    self._append_log('[扫描] ' + message)
+                self._update_selection()
+
+            self._start_process('scanning', program, discovery_arguments(root),
+                                root, environment, scanned, capture=True)
+        except (OSError, RuntimeError, ValueError) as exc:
+            self._show_error(str(exc))
+
+    def _fill_packages_table(self):
         self.package_checkboxes.clear()
-        self.package_dependencies.clear()
-        self.reverse_dependencies.clear()
-
-        # 第一遍：收集所有包和它们的依赖
-        available_packages = {}
-        package_paths = {}  # 存储包路径用于计算大小
-        for root, dirs, files in os.walk(src_dir):
-            if 'package.xml' in files:
-                package_xml_path = os.path.join(root, 'package.xml')
-                package_name = self.get_package_name_from_xml(package_xml_path)
-                if package_name:
-                    available_packages[package_name] = package_xml_path
-                    package_paths[package_name] = root  # 存储包的根目录路径
-                    self.package_dependencies[package_name] = set()
-                    self.reverse_dependencies[package_name] = set()
-
-        # 第二遍：构建依赖关系
-        for package_name, xml_path in available_packages.items():
-            deps = self.get_package_dependencies(xml_path)
-            # 只保留工作空间内的依赖
-            workspace_deps = deps.intersection(available_packages.keys())
-            self.package_dependencies[package_name] = workspace_deps
-            # 构建反向依赖
-            for dep in workspace_deps:
-                self.reverse_dependencies[dep].add(package_name)
-
-        # 填充表格
-        for package_name in sorted(available_packages.keys()):
+        self.packages_table.setRowCount(0)
+        for name, package in sorted(self.snapshot.packages.items()):
             row = self.packages_table.rowCount()
             self.packages_table.insertRow(row)
-
-            # 选择列：复选框（居中显示）
             checkbox = QCheckBox()
-            if package_name in self.config.get('last_selected_packages', []):
-                checkbox.setChecked(True)
             checkbox.stateChanged.connect(
-                lambda state, pkg=package_name: self.on_package_checkbox_changed(pkg, state)
-            )
-            
-            # 创建一个容器widget来让复选框居中
-            checkbox_widget = QWidget()
-            checkbox_layout = QHBoxLayout(checkbox_widget)
-            checkbox_layout.addWidget(checkbox)
-            checkbox_layout.setAlignment(Qt.AlignCenter)
-            checkbox_layout.setContentsMargins(0, 0, 0, 0)
-            
-            self.packages_table.setCellWidget(row, 0, checkbox_widget)
-
-            # 包名列
-            item = QTableWidgetItem(package_name)
+                lambda state, pkg=name: self.on_package_checkbox_changed(pkg, state))
+            self.package_checkboxes[name] = checkbox
+            container = QWidget()
+            layout = QHBoxLayout(container)
+            layout.addWidget(checkbox)
+            layout.setAlignment(Qt.AlignCenter)
+            layout.setContentsMargins(0, 0, 0, 0)
+            self.packages_table.setCellWidget(row, 0, container)
+            item = QTableWidgetItem(name)
             item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+            item.setToolTip(f'{package.path}\n构建类型: {package.build_type}')
             self.packages_table.setItem(row, 1, item)
+            size = QTableWidgetItem(self.format_size(self.get_package_size(package.path)))
+            size.setFlags(size.flags() & ~Qt.ItemIsEditable)
+            self.packages_table.setItem(row, 2, size)
+        self._apply_search_filter(self.search_edit.text())
 
-            # 包大小列
-            package_path = package_paths[package_name]
-            package_size = self.get_package_size(package_path)
-            size_text = self.format_size(package_size)
-            size_item = QTableWidgetItem(size_text)
-            size_item.setFlags(size_item.flags() & ~Qt.ItemIsEditable)
-            self.packages_table.setItem(row, 2, size_item)
-
-            self.package_checkboxes[package_name] = checkbox
-
-        # 应用搜索过滤
+    def _update_selection(self):
+        self.selection_verified = False
+        self.effective_packages = closure(self.explicit_targets, self.package_dependencies)
+        self._apply_selection_widgets()
+        self.save_config()
+        if not self.snapshot or self.snapshot.errors or not self.explicit_targets:
+            self._set_operation('idle')
+            return
+        snapshot = self.snapshot
+        targets = set(self.explicit_targets)
         try:
-            self._apply_search_filter(self.search_edit.text())
-        except Exception:
-            pass
+            if fingerprint(snapshot.root, snapshot.environment, snapshot.packages) != snapshot.fingerprint:
+                raise WorkspaceError('包清单已变化，请刷新后重新选择')
 
+            def selected(result):
+                if not result.succeeded:
+                    self._report_process_failure(result, '依赖校核')
+                    return
+                if 'ERROR' in result.stderr or 'Traceback' in result.stderr:
+                    raise WorkspaceError('colcon 依赖校核报告错误，请检查日志')
+                if fingerprint(snapshot.root, snapshot.environment, snapshot.packages) != snapshot.fingerprint:
+                    raise WorkspaceError('依赖校核期间清单已变化，请刷新')
+                self.effective_packages = parse_selection(
+                    result.stdout, targets, snapshot.packages)
+                self.selection_verified = True
+                self._apply_selection_widgets()
+                self.status.showMessage(
+                    f'目标 {len(targets)} 个，实际构建集合 {len(self.effective_packages)} 个')
+
+            self._start_process(
+                'checking', colcon_program(snapshot.environment),
+                discovery_arguments(snapshot.root, targets), snapshot.root,
+                snapshot.environment, selected, capture=True)
+        except (OSError, RuntimeError, ValueError) as exc:
+            self._show_error(str(exc))
+            self._set_operation('idle')
+
+    def _apply_selection_widgets(self):
+        blockers = [QSignalBlocker(cb) for cb in self.package_checkboxes.values()]
+        for name, checkbox in self.package_checkboxes.items():
+            derived = name in self.effective_packages and name not in self.explicit_targets
+            checkbox.setChecked(name in self.effective_packages)
+            checkbox.setEnabled(self.operation == 'idle' and not derived)
+            if derived:
+                owners = sorted(t for t in self.explicit_targets
+                                if name in closure({t}, self.package_dependencies))
+                checkbox.setToolTip('自动依赖，请先取消引用它的目标。来源: ' +
+                                    (', '.join(owners) or 'colcon 元数据/依赖选择'))
+            else:
+                checkbox.setToolTip('用户选择的构建目标')
+        del blockers
 
     def build_package(self):
-        """使用 QProcess 启动编译并将日志实时输出到右侧面板。"""
-        if not self.workspace_root:
-            QMessageBox.warning(self, 'Error', 'Please select workspace first!')
+        if self.operation != 'idle' or not self.snapshot or not self.selection_verified:
             return
+        snapshot = self.snapshot
+        targets = set(self.explicit_targets)
+        previous = set(self.effective_packages)
+        options = {
+            'symlink_install': self.symlink_check.isChecked(),
+            'parallel_workers': self.workers_spin.value(),
+            'build_type': self.build_type_combo.currentData(),
+        }
+        try:
+            self._operation_lock = workspace_lock(snapshot.root).acquire()
+            request = build_request(snapshot, targets, previous, options)
 
-        selected_packages = [
-            pkg for pkg, cb in self.package_checkboxes.items() if cb.isChecked()
-        ]
-        if not selected_packages:
-            QMessageBox.warning(self, 'Error', 'Please select at least one package!')
-            return
+            def checked(result):
+                if not result.succeeded:
+                    self._release_operation_lock()
+                    self._report_process_failure(result, '构建前校核')
+                    return
+                if 'ERROR' in result.stderr or 'Traceback' in result.stderr:
+                    raise WorkspaceError('构建前校核报告错误，请检查日志')
+                actual = parse_selection(result.stdout, targets, snapshot.packages)
+                if actual != previous:
+                    self.effective_packages = actual
+                    self._apply_selection_widgets()
+                    self._release_operation_lock()
+                    self._show_error('实际构建集合发生变化，已更新列表，请检查后重新点击编译')
+                    return
+                # Recheck manifests and options after the asynchronous query.
+                current = build_request(snapshot, targets, actual, options)
+                self.log_text.clear()
+                self._append_log('工作空间: ' + str(current.root))
+                self._append_log('环境来自本次扫描快照，ROS_DISTRO=' +
+                                 current.environment.get('ROS_DISTRO', '未知'))
+                self._append_log('命令: ' + shlex.join([current.program, *current.arguments]))
+                self._start_process('building', current.program, current.arguments,
+                                    current.root, current.environment, self._build_completed)
 
-        cmd = ['colcon', 'build']
-        if self.symlink_check.isChecked():
-            cmd.append('--symlink-install')
-        workers = int(self.config.get('parallel_workers', os.cpu_count() or 8))
-        cmd.extend(['--parallel-workers', str(workers)])
-        # 构建类型（CMAKE_BUILD_TYPE）
-        build_type = self.config.get('build_type', 'auto')
-        if build_type in ['Release', 'Debug']:
-            cmd.extend(['--cmake-args', f'-DCMAKE_BUILD_TYPE={build_type}'])
-        cmd.extend(['--packages-select'])
-        cmd.extend(selected_packages)
+            self._start_process('checking', request.program,
+                                discovery_arguments(snapshot.root, targets), snapshot.root,
+                                snapshot.environment, checked, capture=True)
+        except Exception as exc:
+            self._release_operation_lock()
+            self._show_error(str(exc))
 
-        # 准备 UI
-        self.log_text.clear()
-        self.status.showMessage('开始编译...')
-        self.progress.setVisible(True)
-        self._set_building_ui_state(True)
-
-        # 启动进程
-        self.build_process = QProcess(self)
-        self.build_process.setProgram(cmd[0])
-        self.build_process.setArguments(cmd[1:])
-        self.build_process.setWorkingDirectory(self.workspace_root)
-        self.build_process.readyReadStandardOutput.connect(self._read_build_stdout)
-        self.build_process.readyReadStandardError.connect(self._read_build_stderr)
-        self.build_process.finished.connect(self._on_build_finished)
-        self.build_process.errorOccurred.connect(self._on_build_error)
-        self.build_process.start()
-        if not self.build_process.waitForStarted(3000):
-            self._append_log('[错误] 无法启动构建进程。')
-            self.progress.setVisible(False)
-            self._set_building_ui_state(False)
-
-    def stop_build(self):
-        """停止当前编译。"""
-        if self.build_process and self.build_process.state() != QProcess.NotRunning:
-            self.build_process.kill()
-            self.build_process.waitForFinished(1000)
-            self.status.showMessage('已停止编译')
-            self.progress.setVisible(False)
-            self._set_building_ui_state(False)
-
-    def _append_log(self, text: str):
-        self.log_text.append(text.rstrip())
-
-    def _read_build_stdout(self):
-        data = bytes(self.build_process.readAllStandardOutput()).decode('utf-8', 'ignore')
-        for line in data.splitlines():
-            self._append_log(line)
-
-    def _read_build_stderr(self):
-        data = bytes(self.build_process.readAllStandardError()).decode('utf-8', 'ignore')
-        for line in data.splitlines():
-            self._append_log(f"[ERR] {line}")
-
-    def _on_build_finished(self, code: int, _status):
-        self.progress.setVisible(False)
-        self._set_building_ui_state(False)
-        if code == 0:
+    def _build_completed(self, result):
+        self._release_operation_lock()
+        if result.succeeded:
             self.status.showMessage('编译成功')
-            QMessageBox.information(self, 'Success', 'Build completed successfully!')
+            self._append_log('编译成功')
             self.save_config()
         else:
-            self.status.showMessage('编译失败')
-            QMessageBox.critical(self, 'Error', 'Build failed. 请查看日志。')
+            self._report_process_failure(result, '编译')
 
-    def _on_build_error(self, _err):
-        self.progress.setVisible(False)
-        self._set_building_ui_state(False)
-        self.status.showMessage('构建进程启动失败')
-        QMessageBox.critical(self, 'Error', 'Failed to start build process.')
+    def _start_process(self, operation, program, arguments, root, environment, callback,
+                       capture=False):
+        self._set_operation(operation)
+        self._operation_callback = callback
+        try:
+            self._operation_id = self.runner.start(
+                program, list(arguments), root, environment, capture=capture,
+                timeout_ms=60000 if capture else 0)
+        except Exception:
+            self._operation_callback = None
+            self._operation_id = None
+            self._set_operation('idle')
+            raise
 
-    def _set_building_ui_state(self, building: bool):
-        # 在构建期间禁用部分控件
-        if hasattr(self, 'act_build'):
-            self.act_build.setEnabled(not building)
-        if hasattr(self, 'act_stop'):
-            self.act_stop.setEnabled(building)
-        if hasattr(self, 'build_primary_btn'):
-            self.build_primary_btn.setEnabled(not building)
-        if hasattr(self, 'clean_secondary_btn'):
-            self.clean_secondary_btn.setEnabled(not building)
-        if hasattr(self, 'build_type_combo'):
-            self.build_type_combo.setEnabled(not building)
-        self.symlink_check.setEnabled(not building)
-        self.workers_spin.setEnabled(not building)
-        if hasattr(self, 'packages_table'):
-            self.packages_table.setEnabled(not building)
-        for cb in self.package_checkboxes.values():
-            cb.setEnabled(not building)
+    def _on_process_output(self, task_id, line, stderr):
+        if task_id == self._operation_id:
+            # Discovery results are consumed as data; its diagnostics remain visible.
+            if self.operation == 'building' or stderr or self.operation == 'cancelling':
+                self._append_log(('[stderr] ' if stderr else '') + line)
 
+    def _on_process_completed(self, result):
+        if result.task_id != self._operation_id:
+            return
+        callback = self._operation_callback
+        self._operation_callback = None
+        self._operation_id = None
+        self._set_operation('idle')
+        if self._close_pending:
+            self._release_operation_lock()
+            QTimer.singleShot(0, self.close)
+            return
+        try:
+            if callback:
+                callback(result)
+        except Exception as exc:
+            self._release_operation_lock()
+            self._show_error(str(exc))
+        finally:
+            if not self.runner.active:
+                self._set_operation('idle')
+
+    def _report_process_failure(self, result, label):
+        if result.cancelled and not result.error:
+            self.status.showMessage(label + '已取消')
+            self._append_log(label + '已取消')
+            return
+        message = result.error or (
+            f'{label}失败，退出码 {result.returncode}' if result.normal_exit
+            else label + '进程异常退出')
+        self._show_error(message)
+
+    def stop_build(self):
+        if self.runner.active:
+            self._set_operation('cancelling')
+            self.runner.cancel()
+
+    def _append_log(self, text):
+        cursor = self.log_text.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        cursor.insertText(str(text) + '\n')
+        self.log_text.setTextCursor(cursor)
+        self.log_text.ensureCursorVisible()
+
+    def _show_error(self, message):
+        self._append_log('[错误] ' + message)
+        self.status.showMessage(message)
+        self.node.get_logger().warning(message)
+        if not self._close_pending:
+            QMessageBox.warning(self, '操作未完成', message)
+
+    def _release_operation_lock(self):
+        if self._operation_lock is not None:
+            self._operation_lock.release()
+            self._operation_lock = None
+
+    def _set_operation(self, operation):
+        self.operation = operation
+        busy = operation != 'idle'
+        self.progress.setVisible(busy)
+        for action in self._workspace_actions:
+            action.setEnabled(not busy)
+        self.build_primary_btn.setEnabled(
+            not busy and self.snapshot is not None and not self.snapshot.errors
+            and bool(self.explicit_targets) and self.selection_verified)
+        self.clean_secondary_btn.setEnabled(not busy and self.snapshot is not None)
+        self.act_stop.setEnabled(operation in ('scanning', 'checking', 'building'))
+        for widget in (self.build_type_combo, self.symlink_check, self.workers_spin):
+            widget.setEnabled(not busy)
+        self.packages_table.setEnabled(not busy)
+        self._apply_selection_widgets()
+        labels = {'scanning': '正在扫描...', 'checking': '正在校核依赖...',
+                  'building': '正在编译...', 'cancelling': '正在停止并等待子进程退出...',
+                  'cleaning': '正在清理...'}
+        if busy:
+            self.status.showMessage(labels.get(operation, operation))
 
     def closeEvent(self, event):
-        self.save_config()
-        super().closeEvent(event)
+        if self.runner.active:
+            self._close_pending = True
+            self.stop_build()
+            event.ignore()
+            return
+        if self.operation == 'cleaning':
+            self._close_pending = True
+            self.status.showMessage('清理完成后退出...')
+            event.ignore()
+            return
+        if not self.save_config():
+            QMessageBox.warning(self, '配置未保存', '本次设置未写入配置文件，请查看日志中的原因。')
+        self._release_operation_lock()
+        event.accept()
 
     def clean_workspace(self):
-        if not self.workspace_root:
-            QMessageBox.warning(self, 'Error', 'Please select workspace first!')
+        if self.operation != 'idle' or not self.snapshot:
             return
-
-        reply = QMessageBox.question(self, 'Confirm Clean',
-                                     'This will clean both build and install directories while preserving specific files.\n'
-                                     'Are you sure you want to continue?',
-                                     QMessageBox.Yes | QMessageBox.No)
-
-        if reply == QMessageBox.Yes:
-            build_dir = os.path.join(self.workspace_root, 'build')
-            install_dir = os.path.join(self.workspace_root, 'install')
-
-            if not (os.path.exists(build_dir) or os.path.exists(install_dir)):
-                QMessageBox.warning(self, 'Error', 'Neither build nor install directory found!')
+        try:
+            root = self.snapshot.root
+            self._operation_lock = workspace_lock(root).acquire()
+            self._set_operation('cleaning')
+            validate_colcon_configuration(
+                root, dict(os.environ), packages=self.snapshot.packages)
+            protected = [self.install_prefix, Path(__file__).resolve(),
+                         self.source_root, Path(self.config_file), Path(sys.executable)]
+            protected.extend(Path(module.__file__).resolve()
+                             for module in tuple(sys.modules.values())
+                             if getattr(module, '__file__', None))
+            plans, errors = {}, {}
+            for include_install in (False, True):
+                try:
+                    plans[include_install] = make_clean_plan(
+                        root, include_install, protected, dict(os.environ))
+                except (OSError, RuntimeError, ValueError) as exc:
+                    errors[include_install] = str(exc)
+            if not plans:
+                raise WorkspaceError('；'.join(dict.fromkeys(errors.values())))
+            box = QMessageBox(self)
+            box.setWindowTitle('确认清理范围')
+            box.setText('工作空间: ' + str(root) + '\n请选择清理范围。保留根级缓存和标记文件。')
+            details = []
+            for include_install, plan in plans.items():
+                details.append('build 和 install' if include_install else '仅 build')
+                for directory in plan.directories:
+                    details.extend(('保留 ' if name in directory.preserve else '删除 ') +
+                                   str(directory.path / name) for name, _ in directory.entries)
+            details.extend('不可用范围: ' + message for message in errors.values())
+            box.setDetailedText('\n'.join(details))
+            if errors:
+                box.setInformativeText('\n'.join(dict.fromkeys(errors.values())))
+            build_button = box.addButton('仅清理 build', QMessageBox.AcceptRole)
+            all_button = box.addButton('清理 build 和 install', QMessageBox.DestructiveRole)
+            box.addButton(QMessageBox.Cancel)
+            build_button.setEnabled(False in plans)
+            all_button.setEnabled(True in plans)
+            box.setDefaultButton(QMessageBox.Cancel)
+            box.exec_()
+            chosen = (False if box.clickedButton() is build_button else
+                      True if box.clickedButton() is all_button else None)
+            if chosen is None:
+                self._release_operation_lock()
+                self._set_operation('idle')
+                if self._close_pending:
+                    QTimer.singleShot(0, self.close)
                 return
+            worker = _CleanWorker(plans[chosen])
+            self._clean_worker = worker
+            worker.signals.completed.connect(self._clean_completed)
+            QThreadPool.globalInstance().start(worker)
+        except (OSError, RuntimeError, ValueError) as exc:
+            self._release_operation_lock()
+            self._set_operation('idle')
+            self._show_error(str(exc))
 
-            try:
-                import shutil
-
-                def remove_contents(directory):
-                    for item in os.listdir(directory):
-                        item_path = os.path.join(directory, item)
-
-                        # 跳过特定目录
-                        if any(skip in item_path for skip in ['.cache', '.idea']):
-                            continue
-
-                        # 如果是文件
-                        if os.path.isfile(item_path):
-                            # 跳过需要保留的文件
-                            if item in ['COLCON_IGNORE', 'compile_commands.json', '.built_by']:
-                                continue
-                            try:
-                                os.remove(item_path)
-                            except OSError as e:
-                                self.node.get_logger().warning(f"Failed to remove file {item_path}: {e}")
-
-                        # 如果是目录
-                        elif os.path.isdir(item_path):
-                            try:
-                                shutil.rmtree(item_path)
-                            except OSError as e:
-                                self.node.get_logger().warning(f"Failed to remove directory {item_path}: {e}")
-
-                # 清理 build 目录
-                if os.path.exists(build_dir):
-                    remove_contents(build_dir)
-
-                # 清理 install 目录
-                if os.path.exists(install_dir):
-                    remove_contents(install_dir)
-
-                QMessageBox.information(self, 'Success',
-                                        'Clean completed successfully!\n'
-                                        'Both build and install directories have been cleaned.')
-
-            except Exception as e:
-                QMessageBox.critical(self, 'Error', f'Clean failed: {str(e)}')
-                self.node.get_logger().error(f'Clean failed: {str(e)}')
+    def _clean_completed(self, result, error):
+        self._clean_worker = None
+        self._release_operation_lock()
+        self._set_operation('idle')
+        if error:
+            self._show_error(error)
+        elif result.failures:
+            for failure in result.failures:
+                self._append_log('[清理失败] ' + failure)
+            self._show_error(f'部分清理失败：删除 {len(result.removed)} 项，'
+                             f'失败 {len(result.failures)} 项，请查看日志')
+        else:
+            self.status.showMessage(f'清理完成：删除 {len(result.removed)} 项，'
+                                    f'保留 {len(result.preserved)} 项')
+        if self._close_pending:
+            QTimer.singleShot(0, self.close)
 
     def _apply_search_filter(self, text: str):
         """根据输入文本过滤包列表（不区分大小写）。"""
@@ -909,12 +1057,8 @@ class WorkspaceManagerGUI(QMainWindow):
 
     def show_dependency_graph(self):
         """打开依赖关系图对话框。优先显示选中包及其依赖，否则显示全部。"""
-        # 准备依赖信息
-        if not self.package_dependencies:
-            try:
-                self.refresh_packages()
-            except Exception:
-                pass
+        if self.operation != 'idle' or not self.snapshot:
+            return
 
         selected = [pkg for pkg, cb in self.package_checkboxes.items() if cb.isChecked()]
         if selected:
@@ -1010,7 +1154,7 @@ class WorkspaceManagerGUI(QMainWindow):
         # 先画节点
         for n, p in pos.items():
             rect = QRectF(p.x(), p.y(), RECT_W, RECT_H)
-            
+
             # 创建可点击的节点项
             node_item = ClickableNodeItem(rect, n, n in selected_set, self.theme_name)
             scene.addItem(node_item)
@@ -1023,11 +1167,12 @@ class WorkspaceManagerGUI(QMainWindow):
             tb = text_item.boundingRect()
             text_item.setPos(rect.center().x() - tb.width()/2, rect.center().y() - tb.height()/2)
             node_item.text_item = text_item
+            node_item._update_colors()
 
         # 再画边
         edge_pen = QPen(QColor(136, 192, 208) if self.theme_name == 'dark' else QColor(100, 100, 100))
         edge_pen.setWidth(1)
-        
+
         for s, d in edges:
             if s not in scene.node_items or d not in scene.node_items:
                 continue
@@ -1052,7 +1197,7 @@ class WorkspaceManagerGUI(QMainWindow):
                 arrow_item = scene.addPolygon(poly, edge_pen, QBrush(edge_pen.color()))
             except Exception:
                 pass
-            
+
             # 保存边的图形项以便后续更新颜色
             scene.edge_items.append((line_item, arrow_item, s, d))
 
@@ -1061,66 +1206,34 @@ class WorkspaceManagerGUI(QMainWindow):
         return scene
 
     def on_package_checkbox_changed(self, package_name, state):
-        """处理包选择状态改变"""
-        if self.package_checkboxes[package_name].isChecked():
-            # 如果选中了一个包，递归选中其所有依赖
-            self.select_dependencies(package_name)
+        if self.operation != 'idle':
+            return
+        if state == Qt.Checked:
+            self.explicit_targets.add(package_name)
         else:
-            # 如果取消选中一个包，递归取消选中依赖它的包
-            self.deselect_dependent_packages(package_name)
-
-    def select_dependencies(self, package_name, visited=None):
-        """递归选中所有依赖的包"""
-        if visited is None:
-            visited = set()
-
-        if package_name in visited:
-            return
-        visited.add(package_name)
-
-        # 选中当前包
-        if package_name in self.package_checkboxes:
-            self.package_checkboxes[package_name].setChecked(True)
-
-        # 递归选中所有依赖
-        for dep in self.package_dependencies.get(package_name, set()):
-            self.select_dependencies(dep, visited)
-
-    def deselect_dependent_packages(self, package_name, visited=None):
-        """递归取消选中依赖此包的包"""
-        if visited is None:
-            visited = set()
-
-        if package_name in visited:
-            return
-        visited.add(package_name)
-
-        # 取消选中依赖此包的所有包
-        for dep in self.reverse_dependencies.get(package_name, set()):
-            if dep in self.package_checkboxes:
-                self.package_checkboxes[dep].setChecked(False)
-                self.deselect_dependent_packages(dep, visited)
+            self.explicit_targets.discard(package_name)
+        self._update_selection()
 
     def show_package_context_menu(self, position):
         """显示包列表的右键菜单"""
         item = self.packages_table.itemAt(position)
         if item is None:
             return
-            
+
         row = item.row()
         package_name_item = self.packages_table.item(row, 1)
         if package_name_item is None:
             return
-            
+
         package_name = package_name_item.text()
-        
+
         menu = QMenu(self)
-        
+
         # 显示包详细信息
         detail_action = QAction('显示包详细信息', self)
         detail_action.triggered.connect(lambda: self.show_package_details(package_name))
         menu.addAction(detail_action)
-        
+
         # 在鼠标位置显示菜单
         menu.exec_(self.packages_table.mapToGlobal(position))
 
@@ -1128,37 +1241,27 @@ class WorkspaceManagerGUI(QMainWindow):
         """显示包的详细信息对话框"""
         if not self.workspace_root:
             return
-            
-        # 查找包路径
-        src_dir = os.path.join(self.workspace_root, 'src')
-        package_path = None
-        
-        for root, dirs, files in os.walk(src_dir):
-            if 'package.xml' in files:
-                package_xml_path = os.path.join(root, 'package.xml')
-                found_name = self.get_package_name_from_xml(package_xml_path)
-                if found_name == package_name:
-                    package_path = root
-                    break
-        
-        if not package_path:
+
+        package = self.snapshot.packages.get(package_name) if self.snapshot else None
+        if package is None:
             QMessageBox.warning(self, '错误', f'找不到包 {package_name} 的路径')
             return
-            
+        package_path = str(package.path)
+
         # 计算详细的大小信息
         details = self.get_package_detailed_info(package_path)
-        
+
         # 创建详细信息对话框
         dialog = QDialog(self)
         dialog.setWindowTitle(f'包详细信息 - {package_name}')
         dialog.resize(600, 400)
-        
+
         layout = QVBoxLayout(dialog)
-        
+
         # 基本信息
         info_text = QTextEdit()
         info_text.setReadOnly(True)
-        
+
         info_content = f"""包名: {package_name}
 路径: {package_path}
 总大小: {self.format_size(details['total_size'])}
@@ -1175,18 +1278,18 @@ class WorkspaceManagerGUI(QMainWindow):
 
 大文件 (>100KB):
 """
-        
+
         for file_info in details['large_files']:
             info_content += f"- {file_info['name']}: {self.format_size(file_info['size'])}\n"
-            
+
         info_text.setPlainText(info_content)
         layout.addWidget(info_text)
-        
+
         # 关闭按钮
         close_btn = QPushButton('关闭')
         close_btn.clicked.connect(dialog.close)
         layout.addWidget(close_btn)
-        
+
         dialog.exec_()
 
     def get_package_detailed_info(self, package_path):
@@ -1203,38 +1306,38 @@ class WorkspaceManagerGUI(QMainWindow):
             'skipped_dirs': 0,
             'large_files': []
         }
-        
+
         try:
             seen_inodes = set()
-            
+
             for dirpath, dirnames, filenames in os.walk(package_path):
                 details['dir_count'] += 1
-                
+
                 # 跳过一些常见的大型缓存目录
                 original_dirs = dirnames[:]
                 dirnames[:] = [d for d in dirnames if d not in ['.git', '__pycache__', '.pytest_cache', 'build', '.vscode']]
                 details['skipped_dirs'] += len(original_dirs) - len(dirnames)
-                
+
                 for filename in filenames:
                     filepath = os.path.join(dirpath, filename)
                     details['file_count'] += 1
-                    
+
                     try:
                         # 获取文件状态
                         stat_info = os.lstat(filepath)
-                        
+
                         # 检查是否是硬链接（避免重复计算）
                         inode = (stat_info.st_dev, stat_info.st_ino)
                         if inode in seen_inodes:
                             continue
                         seen_inodes.add(inode)
-                        
+
                         if os.path.isfile(filepath) and not os.path.islink(filepath):
                             # 普通文件
                             details['regular_files'] += 1
                             details['regular_size'] += stat_info.st_size
                             details['total_size'] += stat_info.st_size
-                            
+
                             # 记录大文件
                             if stat_info.st_size > 100 * 1024:  # 大于100KB
                                 relative_path = os.path.relpath(filepath, package_path)
@@ -1242,24 +1345,24 @@ class WorkspaceManagerGUI(QMainWindow):
                                     'name': relative_path,
                                     'size': stat_info.st_size
                                 })
-                                
+
                         elif os.path.islink(filepath):
                             # 符号链接
                             details['symlinks'] += 1
                             link_size = len(os.readlink(filepath))
                             details['symlink_size'] += link_size
                             details['total_size'] += link_size
-                            
+
                     except (OSError, IOError):
                         details['skipped_files'] += 1
                         continue
-                        
+
             # 按大小排序大文件列表
             details['large_files'].sort(key=lambda x: x['size'], reverse=True)
             # 只保留前10个最大的文件
             details['large_files'] = details['large_files'][:10]
-            
+
         except Exception as e:
-            print(f"Error getting package details: {e}")
-            
+            self.node.get_logger().warning(f"Error getting package details: {e}")
+
         return details

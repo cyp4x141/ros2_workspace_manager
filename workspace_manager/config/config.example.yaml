@@ -1,0 +1,13 @@
+# Configuration is created at this source directory's config.yaml on first use.
+# Code defaults in core/config_store.py are authoritative when a field is absent.
+# Keep this public example free of workspace paths and selection history.
+# Local config.yaml stores paths under the current home directory using ~/.
+# Share this example; local configuration and backups contain private state.
+schema_version: 2
+workspace_path: ''
+workspaces: {}
+symlink_install: true
+always_on_top: false
+parallel_workers: 1
+theme: dark
+build_type: auto
